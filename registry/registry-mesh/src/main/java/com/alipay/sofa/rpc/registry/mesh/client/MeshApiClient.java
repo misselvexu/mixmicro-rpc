@@ -16,11 +16,23 @@
  */
 package com.alipay.sofa.rpc.registry.mesh.client;
 
+import com.alipay.sofa.common.config.SofaConfigs;
+import com.alipay.sofa.rpc.common.config.RpcConfigKeys;
 import com.alipay.sofa.rpc.common.json.JSON;
 import com.alipay.sofa.rpc.common.utils.StringUtils;
 import com.alipay.sofa.rpc.log.Logger;
 import com.alipay.sofa.rpc.log.LoggerFactory;
-import com.alipay.sofa.rpc.registry.mesh.model.*;
+import com.alipay.sofa.rpc.registry.mesh.model.ApplicationInfoRequest;
+import com.alipay.sofa.rpc.registry.mesh.model.ApplicationInfoResult;
+import com.alipay.sofa.rpc.registry.mesh.model.MeshEndpoint;
+import com.alipay.sofa.rpc.registry.mesh.model.PublishServiceRequest;
+import com.alipay.sofa.rpc.registry.mesh.model.PublishServiceResult;
+import com.alipay.sofa.rpc.registry.mesh.model.SubscribeServiceRequest;
+import com.alipay.sofa.rpc.registry.mesh.model.SubscribeServiceResult;
+import com.alipay.sofa.rpc.registry.mesh.model.UnPublishServiceRequest;
+import com.alipay.sofa.rpc.registry.mesh.model.UnPublishServiceResult;
+import com.alipay.sofa.rpc.registry.mesh.model.UnSubscribeServiceRequest;
+import com.alipay.sofa.rpc.registry.mesh.model.UnSubscribeServiceResult;
 
 import java.io.BufferedReader;
 import java.io.DataOutputStream;
@@ -43,14 +55,12 @@ public class MeshApiClient {
     /**
      * 连接超时
      */
-    private static int          connectTimeout = Integer.parseInt(System.getProperty(
-                                                   "mesh_http_connect_timeout", "3000"));      ;
+    private static int          connectTimeout = SofaConfigs.getOrDefault(RpcConfigKeys.MESH_HTTP_CONNECTION_TIMEOUT);
 
     /**
      * 读取超时
      */
-    private static int          readTimeout    = Integer.parseInt(System.getProperty(
-                                                   "mesh_http_read_timeout", "15000"));
+    private static int          readTimeout    = SofaConfigs.getOrDefault(RpcConfigKeys.MESH_HTTP_READ_TIMEOUT);
 
     private static String       errorMessage   = "ERROR";
 

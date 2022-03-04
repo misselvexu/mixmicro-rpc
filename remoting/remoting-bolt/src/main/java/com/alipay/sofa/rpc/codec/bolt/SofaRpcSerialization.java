@@ -32,6 +32,7 @@ import com.alipay.remoting.rpc.protocol.RpcResponseCommand;
 import com.alipay.sofa.rpc.codec.Serializer;
 import com.alipay.sofa.rpc.common.RemotingConstants;
 import com.alipay.sofa.rpc.common.RpcConstants;
+import com.alipay.sofa.rpc.common.annotation.VisibleForTesting;
 import com.alipay.sofa.rpc.common.cache.ReflectCache;
 import com.alipay.sofa.rpc.common.utils.ClassUtils;
 import com.alipay.sofa.rpc.common.utils.CodecUtils;
@@ -41,6 +42,8 @@ import com.alipay.sofa.rpc.context.RpcInvokeContext;
 import com.alipay.sofa.rpc.core.request.RequestBase;
 import com.alipay.sofa.rpc.core.request.SofaRequest;
 import com.alipay.sofa.rpc.core.response.SofaResponse;
+import com.alipay.sofa.rpc.log.Logger;
+import com.alipay.sofa.rpc.log.LoggerFactory;
 import com.alipay.sofa.rpc.transport.AbstractByteBuf;
 import com.alipay.sofa.rpc.transport.ByteArrayWrapperByteBuf;
 
@@ -51,6 +54,8 @@ import com.alipay.sofa.rpc.transport.ByteArrayWrapperByteBuf;
  * @author <a href=mailto:hongwei.yhw@antfin.com>HongWei Yi</a>
  */
 public class SofaRpcSerialization extends DefaultCustomSerializer {
+
+    private static final Logger   LOGGER = LoggerFactory.getLogger(SofaRpcSerialization.class);
 
     protected SimpleMapSerializer mapSerializer;
 
@@ -77,7 +82,17 @@ public class SofaRpcSerialization extends DefaultCustomSerializer {
                 if (sofaResponse.isError() || sofaResponse.getAppResponse() instanceof Throwable) {
                     sofaResponse.addResponseProp(RemotingConstants.HEAD_RESPONSE_ERROR, StringUtils.TRUE);
                 }
-                response.setHeader(mapSerializer.encode(sofaResponse.getResponseProps()));
+                byte[] header = null;
+                try {
+                    header = mapSerializer.encode(sofaResponse.getResponseProps());
+                } catch (Exception e) {
+                    String traceId = (String) RpcInternalContext.getContext().getAttachment("_trace_id");
+                    String rpcId = (String) RpcInternalContext.getContext().getAttachment("_span_id");
+                    LOGGER.error("traceId={}, rpcId={}, Response serializeHeader exception, msg={}", traceId, rpcId,
+                        e.getMessage(), e);
+                    throw new SerializationException(e.getMessage() + ", traceId=" + traceId + ", rpcId=" + rpcId, e);
+                }
+                response.setHeader(header);
             }
             return true;
         }
@@ -181,6 +196,7 @@ public class SofaRpcSerialization extends DefaultCustomSerializer {
             RpcRequestCommand requestCommand = (RpcRequestCommand) request;
             Object requestObject = requestCommand.getRequestObject();
             byte serializerCode = requestCommand.getSerializer();
+            long serializeStartTime = System.nanoTime();
             try {
                 Map<String, String> header = (Map<String, String>) requestCommand.getRequestHeader();
                 if (header == null) {
@@ -197,7 +213,8 @@ public class SofaRpcSerialization extends DefaultCustomSerializer {
             } catch (Exception ex) {
                 throw new SerializationException(ex.getMessage(), ex);
             } finally {
-                recordSerializeRequest(requestCommand, invokeContext);
+                // R5：record request serialization time
+                recordSerializeRequest(requestCommand, invokeContext, serializeStartTime);
             }
         }
         return false;
@@ -208,7 +225,10 @@ public class SofaRpcSerialization extends DefaultCustomSerializer {
      *
      * @param requestCommand 请求对象
      */
-    protected void recordSerializeRequest(RequestCommand requestCommand, InvokeContext invokeContext) {
+    protected void recordSerializeRequest(RequestCommand requestCommand, InvokeContext invokeContext,
+                                          long serializeStartTime) {
+        RpcInvokeContext.getContext().put(RpcConstants.INTERNAL_KEY_REQ_SERIALIZE_TIME_NANO,
+            System.nanoTime() - serializeStartTime);
         if (!RpcInternalContext.isAttachmentEnable()) {
             return;
         }
@@ -240,11 +260,14 @@ public class SofaRpcSerialization extends DefaultCustomSerializer {
                 throw new DeserializationException("Head of request is null or is not map");
             }
             Map<String, String> headerMap = (Map<String, String>) header;
-            byte[] content = requestCommand.getContent();
-            if (content == null || content.length == 0) {
-                throw new DeserializationException("Content of request is null");
-            }
+            String traceId = headerMap.get("rpc_trace_context.sofaTraceId");
+            String rpcId = headerMap.get("rpc_trace_context.sofaRpcId");
+            long deserializeStartTime = System.nanoTime();
             try {
+                byte[] content = requestCommand.getContent();
+                if (content == null || content.length == 0) {
+                    throw new DeserializationException("Content of request is null");
+                }
                 String service = headerMap.get(RemotingConstants.HEAD_SERVICE);
                 ClassLoader oldClassLoader = Thread.currentThread().getContextClassLoader();
 
@@ -260,11 +283,9 @@ public class SofaRpcSerialization extends DefaultCustomSerializer {
 
                     //for service mesh or other scene, we need to add more info from header
                     if (sofaRequest instanceof SofaRequest) {
-                        for (Map.Entry<String, String> entry : headerMap.entrySet()) {
-                            ((SofaRequest) sofaRequest).addRequestProp(entry.getKey(), entry.getValue());
-                        }
+                        setRequestPropertiesWithHeaderInfo(headerMap, (SofaRequest) sofaRequest);
+                        parseRequestHeader(headerMap, (SofaRequest) sofaRequest);
                     }
-
                     requestCommand.setRequestObject(sofaRequest);
                 } finally {
                     Thread.currentThread().setContextClassLoader(oldClassLoader);
@@ -272,12 +293,60 @@ public class SofaRpcSerialization extends DefaultCustomSerializer {
 
                 return true;
             } catch (Exception ex) {
-                throw new DeserializationException(ex.getMessage(), ex);
+                LOGGER.error("traceId={}, rpcId={}, Request deserializeContent exception, msg={}", traceId, rpcId,
+                    ex.getMessage(), ex);
+                throw new DeserializationException(ex.getMessage() + ", traceId=" + traceId + ", rpcId=" + rpcId, ex);
             } finally {
-                recordDeserializeRequest(requestCommand);
+                // R6：Record request deserialization time
+                recordDeserializeRequest(requestCommand, deserializeStartTime);
             }
         }
         return false;
+    }
+
+    @VisibleForTesting
+    protected void parseRequestHeader(Map<String, String> headerMap, SofaRequest sofaRequest) {
+        // 处理 tracer
+        parseRequestHeader(RemotingConstants.RPC_TRACE_NAME, headerMap, sofaRequest);
+        Map<String, Object> requestProps = sofaRequest.getRequestProps();
+        if (requestProps == null) {
+            for (Map.Entry<String, String> entry : headerMap.entrySet()) {
+                sofaRequest.addRequestProp(entry.getKey(), entry.getValue());
+            }
+        } else {
+            replaceWithHeaderMap(headerMap, requestProps);
+        }
+    }
+
+    private void parseRequestHeader(String key, Map<String, String> headerMap,
+                                    SofaRequest sofaRequest) {
+        Map<String, String> traceMap = new HashMap<String, String>();
+        CodecUtils.treeCopyTo(key + ".", headerMap, traceMap, true);
+        Object traceCtx = sofaRequest.getRequestProp(key);
+        if (traceCtx == null) {
+            sofaRequest.addRequestProp(key, traceMap);
+        } else if (traceCtx instanceof Map) {
+            ((Map<String, String>) traceCtx).putAll(traceMap);
+        }
+    }
+
+    private void replaceWithHeaderMap(Map<String, String> headerMap, Map props) {
+        if (headerMap == null || props == null) {
+            return;
+        }
+        // 1. 如果 key 已经在requestProps存在，value 为 String 时进行覆盖
+        // 2. header 中的 value 为 Blank 时不进行覆盖
+        for (Map.Entry<String, String> entry : headerMap.entrySet()) {
+            Object o = props.get(entry.getKey());
+            if (o == null) {
+                props.put(entry.getKey(), entry.getValue());
+            } else if (o instanceof String) {
+                if (StringUtils.isBlank((CharSequence) o)
+                    || StringUtils.isNotBlank(entry.getValue())) {
+                    props.put(entry.getKey(), entry.getValue());
+                }
+            }
+        }
     }
 
     /**
@@ -285,7 +354,9 @@ public class SofaRpcSerialization extends DefaultCustomSerializer {
      *
      * @param requestCommand 请求对象
      */
-    private void recordDeserializeRequest(RequestCommand requestCommand) {
+    private void recordDeserializeRequest(RequestCommand requestCommand, long deserializeStartTime) {
+        RpcInvokeContext.getContext().put(RpcConstants.INTERNAL_KEY_REQ_DESERIALIZE_TIME_NANO, System.nanoTime() -
+            deserializeStartTime);
         if (!RpcInternalContext.isAttachmentEnable()) {
             return;
         }
@@ -306,15 +377,21 @@ public class SofaRpcSerialization extends DefaultCustomSerializer {
         if (response instanceof RpcResponseCommand) {
             RpcResponseCommand responseCommand = (RpcResponseCommand) response;
             byte serializerCode = response.getSerializer();
+            long serializeStartTime = System.nanoTime();
             try {
                 Serializer rpcSerializer = com.alipay.sofa.rpc.codec.SerializerFactory.getSerializer(serializerCode);
                 AbstractByteBuf byteBuf = rpcSerializer.encode(responseCommand.getResponseObject(), null);
                 responseCommand.setContent(byteBuf.array());
                 return true;
             } catch (Exception ex) {
-                throw new SerializationException(ex.getMessage(), ex);
+                String traceId = (String) RpcInternalContext.getContext().getAttachment("_trace_id");
+                String rpcId = (String) RpcInternalContext.getContext().getAttachment("_span_id");
+                LOGGER.error("traceId={}, rpcId={}, Response serializeContent exception, msg = {}", traceId, rpcId,
+                    ex.getMessage(), ex);
+                throw new SerializationException(ex.getMessage() + ", traceId=" + traceId + ", rpcId=" + rpcId, ex);
             } finally {
-                recordSerializeResponse(responseCommand);
+                // R6：Record response serialization time
+                recordSerializeResponse(responseCommand, serializeStartTime);
             }
         }
         return false;
@@ -325,7 +402,9 @@ public class SofaRpcSerialization extends DefaultCustomSerializer {
      *
      * @param responseCommand 响应体
      */
-    private void recordSerializeResponse(RpcResponseCommand responseCommand) {
+    private void recordSerializeResponse(RpcResponseCommand responseCommand, long serializeStartTime) {
+        RpcInvokeContext.getContext().put(RpcConstants.INTERNAL_KEY_RESP_SERIALIZE_TIME_NANO, System.nanoTime() -
+            serializeStartTime);
         if (!RpcInternalContext.isAttachmentEnable()) {
             return;
         }
@@ -350,6 +429,8 @@ public class SofaRpcSerialization extends DefaultCustomSerializer {
             if (content == null || content.length == 0) {
                 return false;
             }
+            long deserializeStartTime = System.nanoTime();
+
             try {
                 Object sofaResponse = ClassUtils.forName(responseCommand.getResponseClass()).newInstance();
 
@@ -366,17 +447,33 @@ public class SofaRpcSerialization extends DefaultCustomSerializer {
 
                 Serializer rpcSerializer = com.alipay.sofa.rpc.codec.SerializerFactory.getSerializer(serializer);
                 rpcSerializer.decode(new ByteArrayWrapperByteBuf(responseCommand.getContent()), sofaResponse, header);
-
+                if (sofaResponse instanceof SofaResponse) {
+                    parseResponseHeader(header, (SofaResponse) sofaResponse);
+                }
                 responseCommand.setResponseObject(sofaResponse);
                 return true;
             } catch (Exception ex) {
                 throw new DeserializationException(ex.getMessage(), ex);
             } finally {
-                recordDeserializeResponse(responseCommand, invokeContext);
+                //R5：Record response deserialization time
+                recordDeserializeResponse(responseCommand, invokeContext, deserializeStartTime);
             }
         }
 
         return false;
+    }
+
+    @VisibleForTesting
+    protected void parseResponseHeader(Map<String, String> headerMap, SofaResponse sofaResponse) {
+        // 处理 tracer
+        Map<String, String> responseProps = sofaResponse.getResponseProps();
+        if (responseProps == null) {
+            for (Map.Entry<String, String> entry : headerMap.entrySet()) {
+                sofaResponse.addResponseProp(entry.getKey(), entry.getValue());
+            }
+        } else {
+            replaceWithHeaderMap(headerMap, responseProps);
+        }
     }
 
     protected void putKV(Map<String, String> map, String key, String value) {
@@ -390,7 +487,10 @@ public class SofaRpcSerialization extends DefaultCustomSerializer {
      *
      * @param responseCommand 响应体
      */
-    private void recordDeserializeResponse(RpcResponseCommand responseCommand, InvokeContext invokeContext) {
+    private void recordDeserializeResponse(RpcResponseCommand responseCommand, InvokeContext invokeContext,
+                                           long deserializeStartTime) {
+        RpcInvokeContext.getContext().put(RpcConstants.INTERNAL_KEY_RESP_DESERIALIZE_TIME_NANO, System.nanoTime() -
+            deserializeStartTime);
         if (!RpcInternalContext.isAttachmentEnable()) {
             return;
         }
@@ -411,4 +511,22 @@ public class SofaRpcSerialization extends DefaultCustomSerializer {
         context.setAttachment(RpcConstants.INTERNAL_KEY_RESP_SIZE, respSize);
         context.setAttachment(RpcConstants.INTERNAL_KEY_RESP_DESERIALIZE_TIME, cost);
     }
+
+    /**
+     * 使用header中的值替换部分请求属性
+     * @param headerMap header
+     * @param request SofaRequest
+     */
+    protected void setRequestPropertiesWithHeaderInfo(Map<String, String> headerMap, SofaRequest request) {
+        // Try to obtain the unique name of the target service from the headerMap.
+        // Due to the MOSN routing logic, it may be different from the original service unique name.
+        String headerService = headerMap.get(RemotingConstants.HEAD_SERVICE);
+        if (headerService == null) {
+            headerService = headerMap.get(RemotingConstants.HEAD_TARGET_SERVICE);
+        }
+        if (StringUtils.isNotBlank(headerService)) {
+            request.setTargetServiceUniqueName(headerService);
+        }
+    }
+
 }

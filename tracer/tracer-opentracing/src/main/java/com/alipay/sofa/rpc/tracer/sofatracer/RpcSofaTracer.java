@@ -35,6 +35,7 @@ import com.alipay.sofa.rpc.common.utils.ExceptionUtils;
 import com.alipay.sofa.rpc.common.utils.NetUtils;
 import com.alipay.sofa.rpc.common.utils.StringUtils;
 import com.alipay.sofa.rpc.context.RpcInternalContext;
+import com.alipay.sofa.rpc.context.RpcInvokeContext;
 import com.alipay.sofa.rpc.core.exception.RpcErrorType;
 import com.alipay.sofa.rpc.core.exception.SofaRpcException;
 import com.alipay.sofa.rpc.core.request.SofaRequest;
@@ -49,12 +50,16 @@ import com.alipay.sofa.rpc.tracer.sofatracer.log.digest.RpcServerDigestSpanJsonE
 import com.alipay.sofa.rpc.tracer.sofatracer.log.stat.RpcClientStatJsonReporter;
 import com.alipay.sofa.rpc.tracer.sofatracer.log.stat.RpcServerStatJsonReporter;
 import com.alipay.sofa.rpc.tracer.sofatracer.log.tags.RpcSpanTags;
+import com.alipay.sofa.rpc.tracer.sofatracer.log.tags.TracerRecord;
 import com.alipay.sofa.rpc.tracer.sofatracer.log.type.RpcTracerLogEnum;
 import io.opentracing.tag.Tags;
 
 import java.net.InetSocketAddress;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.StringJoiner;
+import java.util.TreeMap;
+import java.util.concurrent.TimeUnit;
 
 /**
  * SofaTracer
@@ -185,7 +190,7 @@ public class RpcSofaTracer extends Tracer {
         RpcInternalContext rpcInternalContext = RpcInternalContext.getContext();
         ProviderInfo providerInfo;
         if ((providerInfo = rpcInternalContext.getProviderInfo()) != null &&
-            providerInfo.getRpcVersion() >= 50100) { // 版本>5.1.0
+            getRpcVersionFromProvider(providerInfo) >= 50100) { // 版本>5.1.0
             //新调用新:缓存在 Request 中
             String serializedSpanContext = sofaTracerSpanContext.serializeSpanContext();
             request.addRequestProp(RemotingConstants.NEW_RPC_TRACE_NAME, serializedSpanContext);
@@ -205,6 +210,24 @@ public class RpcSofaTracer extends Tracer {
                 sofaTracerSpanContext.getSysSerializedBaggage());
             request.addRequestProp(RemotingConstants.RPC_TRACE_NAME, oldTracerContext);
         }
+    }
+
+    private int getRpcVersionFromProvider(ProviderInfo providerInfo) {
+        if (providerInfo == null) {
+            return 0;
+        }
+
+        int ver = providerInfo.getRpcVersion();
+        if (ver > 0) {
+            return ver;
+        }
+
+        String verStr = providerInfo.getStaticAttr(RpcConstants.CONFIG_KEY_RPC_VERSION);
+        if (StringUtils.isNotBlank(verStr)) {
+            return Integer.parseInt(verStr);
+        }
+
+        return 0;
     }
 
     protected String getEmptyStringIfNull(Map map, String key) {
@@ -264,6 +287,9 @@ public class RpcSofaTracer extends Tracer {
             //adjust for generic invoke
             clientSpan.setTag(RpcSpanTags.METHOD, request.getMethodName());
         }
+        RpcInvokeContext invokeContext = RpcInvokeContext.getContext();
+        clientSpan.setTag(RpcSpanTags.PHASE_TIME_COST, generateClientPhaseTimeCostSpan(invokeContext));
+        clientSpan.setTag(RpcSpanTags.SPECIAL_TIME_MARK, generateClientSpecialTimeMarkSpan(invokeContext));
 
         Throwable throwableShow = exceptionThrow;
         // 区分出各个异常信息
@@ -354,6 +380,62 @@ public class RpcSofaTracer extends Tracer {
         }
     }
 
+    private String generateClientSpecialTimeMarkSpan(RpcInvokeContext context) {
+        Long sendTime = (Long) context.get(RpcConstants.INTERNAL_KEY_CLIENT_SEND_TIME_MICRO);
+        Long receiverTime = (Long) context.get(RpcConstants.INTERNAL_KEY_CLIENT_RECEIVE_TIME_MICRO);
+        StringBuilder sb = new StringBuilder(checkTime(sendTime).toString());
+        return sb.append("&").append(checkTime(receiverTime).toString()).toString();
+    }
+
+    private String generateClientPhaseTimeCostSpan(RpcInvokeContext context){
+
+        TreeMap<String, String> resultMap = new TreeMap<>();
+        Long routerTime = (Long) context.get(RpcConstants.INTERNAL_KEY_CLIENT_ROUTER_TIME_NANO);
+        Long connTime = (Long) context.get(RpcConstants.INTERNAL_KEY_CONN_CREATE_TIME_NANO);
+        Long filterTime = (Long) context.get(RpcConstants.INTERNAL_KEY_CLIENT_FILTER_TIME_NANO);
+        Long balancerTime = (Long) context.get(RpcConstants.INTERNAL_KEY_CLIENT_BALANCER_TIME_NANO);
+        Long reqSerializeTime = (Long) context.get(RpcConstants.INTERNAL_KEY_REQ_SERIALIZE_TIME_NANO);
+        Long respDeSerializeTime = (Long) context.get(RpcConstants.INTERNAL_KEY_RESP_DESERIALIZE_TIME_NANO);
+        resultMap.put(TracerRecord.R1.toString(), calculateNanoTime(routerTime).toString());
+        resultMap.put(TracerRecord.R2.toString(), calculateNanoTime(connTime).toString());
+        resultMap.put(TracerRecord.R3.toString(), calculateNanoTime(filterTime).toString());
+        resultMap.put(TracerRecord.R4.toString(), calculateNanoTime(balancerTime).toString());
+        resultMap.put(TracerRecord.R5.toString(),appendResult(calculateNanoTime(reqSerializeTime).toString(), calculateNanoTime(respDeSerializeTime).toString()));
+
+        StringBuilder sb = new StringBuilder();
+
+        for (Map.Entry<String, String> entry : resultMap.entrySet()) {
+            sb.append(entry.getKey());
+            sb.append("=");
+            sb.append(entry.getValue());
+            sb.append("&");
+        }
+        return sb.toString();
+    }
+
+    private Long calculateNanoTime(Long time) {
+        if (time == null) {
+            return -1L;
+        }
+        return TimeUnit.MICROSECONDS.convert(time, TimeUnit.NANOSECONDS);
+    }
+
+    private Long checkTime(Long time) {
+        if (time == null) {
+            return -1L;
+        }
+        return time;
+    }
+
+    private String appendResult(String... strings) {
+        StringJoiner stringJoiner = new StringJoiner("/");
+        for (String string : strings) {
+            stringJoiner.add(string);
+        }
+        return stringJoiner.toString();
+
+    }
+
     private void generateClientErrorContext(Map<String, String> context, SofaRequest request, SofaTracerSpan clientSpan) {
         Map<String, String> tagsWithStr = clientSpan.getTagsWithStr();
         //记录的上下文信息// do not change this key
@@ -430,11 +512,13 @@ public class RpcSofaTracer extends Tracer {
                 String callerZone = this.getEmptyStringIfNull(contextMap, TracerCompatibleConstants.CALLER_ZONE_KEY);
                 String callerIdc = this.getEmptyStringIfNull(contextMap, TracerCompatibleConstants.CALLER_IDC_KEY);
                 String callerIp = this.getEmptyStringIfNull(contextMap, TracerCompatibleConstants.CALLER_IP_KEY);
+
                 SofaTracerSpanContext spanContext = new SofaTracerSpanContext(traceId, rpcId);
-                //解析采样标记
-                spanContext.setSampled(parseSampled(contextMap, spanContext));
+
                 spanContext.deserializeBizBaggage(bizBaggage);
                 spanContext.deserializeSysBaggage(sysBaggage);
+                //解析采样标记
+                spanContext.setSampled(parseSampled(contextMap, spanContext));
                 //tags
                 tags.put(RpcSpanTags.REMOTE_APP, callerApp);
                 tags.put(RpcSpanTags.REMOTE_ZONE, callerZone);
@@ -450,16 +534,22 @@ public class RpcSofaTracer extends Tracer {
     }
 
     private boolean parseSampled(Map<String, String> contextMap, SofaTracerSpanContext spanContext) {
-        // 新版本中tracer标记不在 baggage 中,兼容老版本
-        String oldSampledMark = spanContext.getSysBaggage().get(
-            TracerCompatibleConstants.SAMPLING_MARK);
-        // 默认不会设置采样标记，即默认采样
-        if (StringUtils.isBlank(oldSampledMark) || "true".equals(oldSampledMark)) {
-            return true;
+        // 1. 新版本从 context 里获取采样标记
+        String sampleMark = this.getEmptyStringIfNull(contextMap, TracerCompatibleConstants.SAMPLING_MARK);
+        // 新版本有显示设置采样标记
+        if (StringUtils.isNotBlank(sampleMark)) {
+            return Boolean.parseBoolean(sampleMark);
         }
-        // 除显示获取 tracer 上下文中的采样标记之外，默认全部采样
-        String sampledStr = this.getEmptyStringIfNull(contextMap, TracerCompatibleConstants.SAMPLING_MARK);
-        return StringUtils.isNotBlank(sampledStr) ? Boolean.valueOf(sampledStr) : true;
+
+        // 2. 老版本从 baggage 里获取采样标记
+        sampleMark = spanContext.getSysBaggage().get(TracerCompatibleConstants.SAMPLING_MARK);
+        // 老版本有显示设置采样标记
+        if (StringUtils.isNotBlank(sampleMark)) {
+            return Boolean.parseBoolean(sampleMark);
+        }
+
+        // 新老版本都没有显示设置标记，则默认采样
+        return true;
     }
 
     @Override
@@ -473,6 +563,7 @@ public class RpcSofaTracer extends Tracer {
         serverSpan.log(LogData.SERVER_SEND_EVENT_VALUE);
 
         RpcInternalContext context = RpcInternalContext.getContext();
+        RpcInvokeContext invokeContext = RpcInvokeContext.getContext();
         serverSpan.setTag(RpcSpanTags.RESP_SERIALIZE_TIME,
             (Number) context.getAttachment(RpcConstants.INTERNAL_KEY_RESP_SERIALIZE_TIME));
         serverSpan.setTag(RpcSpanTags.REQ_DESERIALIZE_TIME,
@@ -481,6 +572,9 @@ public class RpcSofaTracer extends Tracer {
         serverSpan.setTag(RpcSpanTags.REQ_SIZE, (Number) context.getAttachment(RpcConstants.INTERNAL_KEY_REQ_SIZE));
         //当前线程名
         serverSpan.setTag(RpcSpanTags.CURRENT_THREAD_NAME, Thread.currentThread().getName());
+
+        serverSpan.setTag(RpcSpanTags.SERVER_PHASE_TIME_COST, generateServerPhaseTimeCostSpan(invokeContext));
+        serverSpan.setTag(RpcSpanTags.SERVER_SPECIAL_TIME_MARK, generateServerSpecialTimeMark(invokeContext));
 
         Throwable throwableShow = exception;
         String tracerErrorCode = StringUtils.EMPTY;
@@ -527,6 +621,40 @@ public class RpcSofaTracer extends Tracer {
         // 结果码（00=成功/01=业务异常/02=RPC逻辑错误）
         serverSpan.setTag(RpcSpanTags.RESULT_CODE, resultCode);
         serverSpan.finish();
+    }
+
+    private String generateServerSpecialTimeMark(RpcInvokeContext context) {
+        Long boltReceiveTime = (Long) context.get(RpcConstants.INTERNAL_KEY_SERVER_RECEIVE_TIME_MICRO);
+        Long serverSendTime = (Long) context.get(RpcConstants.INTERNAL_KEY_SERVER_SEND_TIME_MICRO);
+        StringBuilder sb = new StringBuilder(checkTime(boltReceiveTime).toString());
+        return sb.append("&").append(checkTime(serverSendTime).toString()).toString();
+    }
+
+    private String generateServerPhaseTimeCostSpan(RpcInvokeContext context) {
+        TreeMap<String, String> resultMap = new TreeMap<>();
+        Long reqDeSerializeTime = (Long) context.get(RpcConstants.INTERNAL_KEY_REQ_DESERIALIZE_TIME_NANO);
+        Long respSerializeTime = (Long) context.get(RpcConstants.INTERNAL_KEY_RESP_SERIALIZE_TIME_NANO);
+        Long bizWaitTime = (Long) context.get(RpcConstants.INTERNAL_KEY_PROCESS_WAIT_TIME_NANO);
+        Long bizProcessTime = (Long) context.get(RpcConstants.INTERNAL_KEY_IMPL_ELAPSE_NANO);
+        Long ambushTime = (Long) context.get(RpcConstants.INTERNAL_KEY_SERVER_AMBUSH_TIME_NANO);
+        Long filterTime = (Long) context.get(RpcConstants.INTERNAL_KEY_SERVER_FILTER_TIME_NANO);
+        Long netWaitTime = (Long) context.get(RpcConstants.INTERNAL_KEY_SERVER_NET_WAIT_NANO);
+
+        resultMap.put(TracerRecord.R6.toString(),appendResult(calculateNanoTime(reqDeSerializeTime).toString(), calculateNanoTime(respSerializeTime).toString()));
+        resultMap.put(TracerRecord.R7.toString(), calculateNanoTime(bizWaitTime).toString());
+        resultMap.put(TracerRecord.R8.toString(), calculateNanoTime(bizProcessTime).toString());
+        resultMap.put(TracerRecord.R9.toString(), calculateNanoTime(ambushTime).toString());
+        resultMap.put(TracerRecord.R10.toString(), calculateNanoTime(filterTime).toString());
+        resultMap.put(TracerRecord.R11.toString(), calculateNanoTime(netWaitTime).toString());
+        StringBuilder sb = new StringBuilder();
+
+        for (Map.Entry<String, String> entry : resultMap.entrySet()) {
+            sb.append(entry.getKey());
+            sb.append("=");
+            sb.append(entry.getValue());
+            sb.append("&");
+        }
+        return sb.toString();
     }
 
     private void generateServerErrorContext(Map<String, String> context, SofaRequest request,

@@ -16,7 +16,8 @@
  */
 package com.alipay.sofa.rpc.message.bolt;
 
-import com.alipay.remoting.InvokeCallback;
+import com.alipay.remoting.RejectedExecutionPolicy;
+import com.alipay.remoting.RejectionProcessableInvokeCallback;
 import com.alipay.sofa.rpc.client.ProviderInfo;
 import com.alipay.sofa.rpc.common.RpcConstants;
 import com.alipay.sofa.rpc.config.ConsumerConfig;
@@ -31,27 +32,31 @@ import com.alipay.sofa.rpc.core.response.SofaResponse;
  * @author <a href="mailto:zhanggeng.zg@antfin.com">GengZhang</a>
  * @since 5.4.0
  */
-public abstract class AbstractInvokeCallback implements InvokeCallback {
+public abstract class AbstractInvokeCallback implements RejectionProcessableInvokeCallback {
     /**
      * 服务消费者配置
      */
-    protected final ConsumerConfig consumerConfig;
+    protected final ConsumerConfig    consumerConfig;
     /**
      * 服务提供者信息
      */
-    protected final ProviderInfo   providerInfo;
+    protected final ProviderInfo      providerInfo;
     /**
      * 请求
      */
-    protected final SofaRequest    request;
+    protected final SofaRequest       request;
     /**
      * 请求运行时的ClassLoader
      */
-    protected ClassLoader          classLoader;
+    protected ClassLoader             classLoader;
     /**
      * 线程上下文
      */
-    protected RpcInternalContext   context;
+    protected RpcInternalContext      context;
+    /**
+     * 线程繁忙时的拒绝策略
+     */
+    protected RejectedExecutionPolicy rejectedExecutionPolicy;
 
     protected AbstractInvokeCallback(ConsumerConfig consumerConfig, ProviderInfo providerInfo, SofaRequest request,
                                      RpcInternalContext context, ClassLoader classLoader) {
@@ -60,6 +65,17 @@ public abstract class AbstractInvokeCallback implements InvokeCallback {
         this.request = request;
         this.context = context;
         this.classLoader = classLoader;
+        this.setRejectedExecutionPolicy(consumerConfig);
+    }
+
+    private void setRejectedExecutionPolicy(ConsumerConfig consumerConfig) {
+        if (null == consumerConfig || consumerConfig.getRejectedExecutionPolicy() == null) {
+            this.rejectedExecutionPolicy = RejectedExecutionPolicy.DISCARD;
+            return;
+        }
+
+        String policy = consumerConfig.getRejectedExecutionPolicy();
+        this.rejectedExecutionPolicy = RejectedExecutionPolicy.valueOf(policy);
     }
 
     protected void recordClientElapseTime() {
@@ -73,16 +89,32 @@ public abstract class AbstractInvokeCallback implements InvokeCallback {
 
     protected void pickupBaggage(SofaResponse response) {
         if (RpcInvokeContext.isBaggageEnable()) {
-            RpcInvokeContext invokeCtx = null;
+            RpcInvokeContext old = null;
+            RpcInvokeContext newContext = null;
             if (context != null) {
-                invokeCtx = (RpcInvokeContext) context.getAttachment(RpcConstants.HIDDEN_KEY_INVOKE_CONTEXT);
+                old = (RpcInvokeContext) context.getAttachment(RpcConstants.HIDDEN_KEY_INVOKE_CONTEXT);
             }
-            if (invokeCtx == null) {
-                invokeCtx = RpcInvokeContext.getContext();
+            if (old == null) {
+                newContext = RpcInvokeContext.getContext();
             } else {
-                RpcInvokeContext.setContext(invokeCtx);
+                RpcInvokeContext.setContext(old);
+                newContext = RpcInvokeContext.getContext();
             }
-            BaggageResolver.pickupFromResponse(invokeCtx, response);
+            BaggageResolver.pickupFromResponse(newContext, response);
+
+            if (old != null) {
+                old.getAllResponseBaggage().putAll(newContext.getAllResponseBaggage());
+                old.getAllRequestBaggage().putAll(newContext.getAllRequestBaggage());
+            }
+
         }
+    }
+
+    /**
+     * @see RejectionProcessableInvokeCallback#rejectedExecutionPolicy() 
+     */
+    @Override
+    public RejectedExecutionPolicy rejectedExecutionPolicy() {
+        return rejectedExecutionPolicy;
     }
 }

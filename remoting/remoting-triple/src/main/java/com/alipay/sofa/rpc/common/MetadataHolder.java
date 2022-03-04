@@ -17,20 +17,21 @@
 package com.alipay.sofa.rpc.common;
 
 
-import java.util.LinkedHashMap;
+import java.util.HashMap;
 import java.util.Map;
 
 /**
  * @author zhaowang
  * @version : MetadataHolder.java, v 0.1 2020年09月09日 4:09 下午 zhaowang Exp $
  */
+@Deprecated
 public class MetadataHolder {
     static final ThreadLocal<Map<String,String>> localContext = new ThreadLocal<>();
 
     public static Map<String, String> getMetaHolder() {
         Map<String, String> stringStringMap = localContext.get();
         if(stringStringMap == null){
-            LinkedHashMap<String, String> value = new LinkedHashMap<>();
+            HashMap<String, String> value = new HashMap<>();
             localContext.set(value);
             return value;
         }
